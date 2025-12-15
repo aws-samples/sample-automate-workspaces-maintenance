@@ -1,11 +1,9 @@
-## My Project
+## Automate maintenance and updates on Amazon WorkSpaces
 
-TODO: Fill this README out!
+CloudFormation template to deploy a WorkSpaces automation to maintain and update Amazon WorkSpaces
+For details refer to Builder Center article:
+[https://builder.aws.com/content/30g909ze1jKxXRgnUdfVdsl4icr/automate-maintenance-and-updates-on-amazon-workspaces](https://builder.aws.com/content/30g909ze1jKxXRgnUdfVdsl4icr/automate-maintenance-and-updates-on-amazon-workspaces)
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
 
 ## Security
 
