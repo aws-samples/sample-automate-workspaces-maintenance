@@ -190,6 +190,48 @@ Resources:
                   - sns:ListSubscriptionsByTopic
                 Resource: !Ref WorkSpacesPatchingTopic
 
+  MaintenanceStateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteStateFiles
+            Status: Enabled
+            Prefix: maintenance-state/
+            ExpirationInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: WorkSpaces Maintenance State
+        - Key: DirectoryId
+          Value: !Ref DirectoryId
+
+  MaintenanceStateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MaintenanceStateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub 'arn:aws:s3:::${MaintenanceStateBucket}'
+              - !Sub 'arn:aws:s3:::${MaintenanceStateBucket}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
   ComplianceReportS3Bucket:
     Type: AWS::S3::Bucket
     Condition: CreateReportBucket
@@ -199,6 +241,10 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
       VersioningConfiguration:
         Status: Enabled
       LifecycleConfiguration:
@@ -213,6 +259,25 @@ Resources:
           Value: !Ref DirectoryId
         - Key: Name
           Value: !Sub '${AWS::StackName}-compliance-reports'
+
+  ComplianceReportS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateReportBucket
+    Properties:
+      Bucket: !Ref ComplianceReportS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub 'arn:aws:s3:::${ComplianceReportS3Bucket}'
+              - !Sub 'arn:aws:s3:::${ComplianceReportS3Bucket}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   ComplianceReportLambdaRole:
     Type: AWS::IAM::Role
@@ -285,19 +350,14 @@ Resources:
           import json
           import os
           from datetime import datetime
-          from typing import List, Dict, Optional, Any
           from collections import Counter
           import io
           
           def lambda_handler(event, context):
-              '''Lambda handler for generating patch compliance reports'''
-              
               try:
-                  # Extract parameters from event
                   patch_group = event.get('PatchGroup', '')
                   directory_id = event.get('DirectoryId', '')
                   
-                  # Initialize clients
                   ssm = boto3.client('ssm')
                   s3 = boto3.client('s3')
                   sns = boto3.client('sns')
@@ -308,195 +368,91 @@ Resources:
                   
                   print(f"Generating compliance report for patch group: {patch_group}")
                   
-                  # Get patch group instances if specified
-                  if patch_group:
-                      target_instances = get_patch_group_instances(ssm, patch_group)
-                  else:
-                      # Get all managed instances
-                      target_instances = get_all_managed_instances(ssm)
+                  # Get all managed instances (batched)
+                  instance_map = {}
+                  paginator = ssm.get_paginator('describe_instance_information')
+                  for page in paginator.paginate():
+                      for inst in page['InstanceInformationList']:
+                          instance_map[inst['InstanceId']] = {
+                              'ComputerName': inst.get('ComputerName', 'Unknown'),
+                              'PingStatus': inst.get('PingStatus', 'Unknown'),
+                              'LastPingDateTime': str(inst.get('LastPingDateTime', 'Unknown'))
+                          }
                   
+                  target_instances = list(instance_map.keys())
                   if not target_instances:
                       raise Exception("No instances found for compliance reporting")
                   
-                  # Generate compliance data
-                  compliance_data = generate_compliance_data(ssm, target_instances, patch_group)
+                  print(f"Found {len(target_instances)} managed instances")
+                  
+                  # Generate compliance data - batch by 20 instances per API call
+                  compliance_data = []
+                  batch_size = 20
+                  for i in range(0, len(target_instances), batch_size):
+                      batch = target_instances[i:i + batch_size]
+                      for instance_id in batch:
+                          try:
+                              paginator_c = ssm.get_paginator('list_compliance_items')
+                              for page in paginator_c.paginate(
+                                  ResourceIds=[instance_id],
+                                  ResourceTypes=['ManagedInstance'],
+                                  Filters=[{'Key': 'ComplianceType', 'Values': ['Patch'], 'Type': 'EQUAL'}]
+                              ):
+                                  for item in page['ComplianceItems']:
+                                      if item['Status'] in ['COMPLIANT', 'NON_COMPLIANT']:
+                                          info = instance_map.get(instance_id, {})
+                                          compliance_data.append({
+                                              'InstanceId': instance_id,
+                                              'ComputerName': info.get('ComputerName', 'Unknown'),
+                                              'PingStatus': info.get('PingStatus', 'Unknown'),
+                                              'LastPingDateTime': info.get('LastPingDateTime', 'Unknown'),
+                                              'PatchName': item.get('Title', 'Unknown'),
+                                              'KBId': item.get('Id', 'Unknown'),
+                                              'Severity': item.get('Severity', 'Unknown'),
+                                              'State': item['Status'],
+                                              'ComplianceType': item['ComplianceType'],
+                                              'LastScanTime': str(item.get('ExecutionSummary', {}).get('ExecutionTime', 'Unknown')),
+                                              'Classification': item.get('Details', {}).get('Classification', 'Unknown'),
+                                              'InstalledTime': item.get('Details', {}).get('InstalledTime', 'N/A'),
+                                              'PatchGroup': patch_group
+                                          })
+                          except Exception as e:
+                              print(f"Error processing instance {instance_id}: {str(e)}")
+                              continue
                   
                   if not compliance_data:
                       raise Exception("No compliance data generated")
                   
-                  # Create CSV content
-                  csv_content = create_csv_content(compliance_data)
+                  # Create CSV
+                  output = io.StringIO()
+                  writer = csv.DictWriter(output, fieldnames=compliance_data[0].keys())
+                  writer.writeheader()
+                  writer.writerows(compliance_data)
+                  csv_content = output.getvalue()
                   
                   # Upload to S3
                   timestamp = datetime.now().strftime("%Y-%m-%dT%H%M")
-                  if patch_group:
-                      filename = f"ComplianceReport_{patch_group}_{timestamp}.csv"
-                  else:
-                      filename = f"ComplianceReport_{directory_id}_{timestamp}.csv"
-                  
+                  filename = f"ComplianceReport_{patch_group or directory_id}_{timestamp}.csv"
                   s3_key = f"{bucket_prefix}/{filename}"
                   
-                  s3.put_object(
-                      Bucket=bucket_name,
-                      Key=s3_key,
-                      Body=csv_content,
-                      ContentType='text/csv',
-                      ServerSideEncryption='AES256'
-                  )
+                  s3.put_object(Bucket=bucket_name, Key=s3_key, Body=csv_content,
+                                ContentType='text/csv', ServerSideEncryption='AES256')
                   
-                  # Generate presigned URL (valid for 7 days)
-                  presigned_url = s3.generate_presigned_url(
-                      'get_object',
-                      Params={'Bucket': bucket_name, 'Key': s3_key},
-                      ExpiresIn=604800  # 7 days
-                  )
+                  s3_console_url = f"https://s3.console.aws.amazon.com/s3/object/{bucket_name}?prefix={s3_key}"
                   
-                  # Calculate statistics
-                  stats = calculate_statistics(compliance_data)
+                  # Statistics
+                  total = len(compliance_data)
+                  compliant = sum(1 for p in compliance_data if p['State'] == 'COMPLIANT')
+                  non_compliant = total - compliant
+                  rate = round((compliant / total) * 100, 2) if total > 0 else 0
+                  severity_counts = dict(Counter(p['Severity'] for p in compliance_data if p['State'] == 'NON_COMPLIANT'))
                   
-                  # Send SNS notification
-                  send_notification(sns, sns_topic_arn, filename, presigned_url, stats, patch_group)
+                  stats = {'total_patches': total, 'compliant_patches': compliant,
+                           'non_compliant_patches': non_compliant, 'compliance_percentage': rate,
+                           'severity_breakdown': severity_counts}
                   
-                  return {
-                      'statusCode': 200,
-                      'body': {
-                          'message': 'Compliance report generated successfully',
-                          'filename': filename,
-                          's3_location': f"s3://{bucket_name}/{s3_key}",
-                          'download_url': presigned_url,
-                          'statistics': stats
-                      }
-                  }
-                  
-              except Exception as e:
-                  print(f"Error generating compliance report: {str(e)}")
-                  return {
-                      'statusCode': 500,
-                      'body': {'error': str(e)}
-                  }
-          
-          def get_patch_group_instances(ssm, group_name):
-              '''Get instances in a specific patch group'''
-              instances = []
-              paginator = ssm.get_paginator('describe_instance_information')
-              
-              for page in paginator.paginate():
-                  for instance in page['InstanceInformationList']:
-                      try:
-                          tags = ssm.list_tags_for_resource(
-                              ResourceType='ManagedInstance',
-                              ResourceId=instance['InstanceId']
-                          )
-                          
-                          for tag in tags.get('TagList', []):
-                              if tag['Key'] == 'PatchGroup' and tag['Value'] == group_name:
-                                  instances.append(instance['InstanceId'])
-                                  break
-                      except:
-                          continue
-              
-              return instances
-          
-          def get_all_managed_instances(ssm):
-              '''Get all managed instances'''
-              instances = []
-              paginator = ssm.get_paginator('describe_instance_information')
-              
-              for page in paginator.paginate():
-                  instances.extend([inst['InstanceId'] for inst in page['InstanceInformationList']])
-              
-              return instances
-          
-          def generate_compliance_data(ssm, instance_ids, patch_group):
-              '''Generate compliance data for instances'''
-              compliance_data = []
-              
-              # Create instance status map
-              instance_map = {}
-              paginator = ssm.get_paginator('describe_instance_information')
-              
-              for page in paginator.paginate():
-                  for instance in page['InstanceInformationList']:
-                      instance_map[instance['InstanceId']] = {
-                          'ComputerName': instance.get('ComputerName', 'Unknown'),
-                          'PingStatus': instance.get('PingStatus', 'Unknown'),
-                          'LastPingDateTime': str(instance.get('LastPingDateTime', 'Unknown'))
-                      }
-              
-              for instance_id in instance_ids:
-                  try:
-                      paginator = ssm.get_paginator('list_compliance_items')
-                      
-                      for page in paginator.paginate(
-                          ResourceIds=[instance_id],
-                          ResourceTypes=['ManagedInstance'],
-                          Filters=[{
-                              'Key': 'ComplianceType',
-                              'Values': ['Patch'],
-                              'Type': 'EQUAL'
-                          }]
-                      ):
-                          for item in page['ComplianceItems']:
-                              if item['Status'] in ['COMPLIANT', 'NON_COMPLIANT']:
-                                  instance_info = instance_map.get(instance_id, {})
-                                  
-                                  compliance_data.append({
-                                      'InstanceId': instance_id,
-                                      'ComputerName': instance_info.get('ComputerName', 'Unknown'),
-                                      'PingStatus': instance_info.get('PingStatus', 'Unknown'),
-                                      'LastPingDateTime': instance_info.get('LastPingDateTime', 'Unknown'),
-                                      'PatchName': item.get('Title', 'Unknown'),
-                                      'KBId': item.get('Id', 'Unknown'),
-                                      'Severity': item.get('Severity', 'Unknown'),
-                                      'State': item['Status'],
-                                      'ComplianceType': item['ComplianceType'],
-                                      'LastScanTime': str(item.get('ExecutionSummary', {}).get('ExecutionTime', 'Unknown')),
-                                      'Classification': item.get('Details', {}).get('Classification', 'Unknown'),
-                                      'InstalledTime': item.get('Details', {}).get('InstalledTime', 'N/A'),
-                                      'PatchGroup': patch_group
-                                  })
-                  except Exception as e:
-                      print(f"Error processing instance {instance_id}: {str(e)}")
-                      continue
-              
-              return compliance_data
-          
-          def create_csv_content(data):
-              '''Create CSV content from compliance data'''
-              if not data:
-                  return ""
-              
-              output = io.StringIO()
-              fieldnames = data[0].keys()
-              writer = csv.DictWriter(output, fieldnames=fieldnames)
-              writer.writeheader()
-              writer.writerows(data)
-              
-              return output.getvalue()
-          
-          def calculate_statistics(data):
-              '''Calculate compliance statistics'''
-              total_patches = len(data)
-              compliant = len([p for p in data if p['State'] == 'COMPLIANT'])
-              non_compliant = len([p for p in data if p['State'] == 'NON_COMPLIANT'])
-              compliance_rate = round((compliant / total_patches) * 100, 2) if total_patches > 0 else 0
-              
-              # Severity breakdown for non-compliant
-              non_compliant_data = [p for p in data if p['State'] == 'NON_COMPLIANT']
-              severity_counts = Counter(p['Severity'] for p in non_compliant_data)
-              
-              return {
-                  'total_patches': total_patches,
-                  'compliant_patches': compliant,
-                  'non_compliant_patches': non_compliant,
-                  'compliance_percentage': compliance_rate,
-                  'severity_breakdown': dict(severity_counts)
-              }
-          
-          def send_notification(sns, topic_arn, filename, download_url, stats, patch_group):
-              '''Send SNS notification with report details'''
-              
-              message = f'''Patch Compliance Report Generated
+                  # SNS notification
+                  message = f'''Patch Compliance Report Generated
           =====================================
           
           Report Details:
@@ -505,25 +461,32 @@ Resources:
           - Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
           
           Compliance Summary:
-          - Total Patches: {stats['total_patches']}
-          - Compliant: {stats['compliant_patches']}
-          - Non-Compliant: {stats['non_compliant_patches']}
-          - Compliance Rate: {stats['compliance_percentage']}%
+          - Total Patches: {total}
+          - Compliant: {compliant}
+          - Non-Compliant: {non_compliant}
+          - Compliance Rate: {rate}%
           
           Severity Breakdown (Non-Compliant):
-          {chr(10).join([f'- {k}: {v}' for k, v in stats['severity_breakdown'].items()])}
+          {chr(10).join([f'- {k}: {v}' for k, v in severity_counts.items()])}
           
-          Download Link (Valid for 7 days):
-          {download_url}
+          Download from S3 console:
+          {s3_console_url}
           
-          Note: The download link will expire in 7 days. Please download the report promptly.
+          Or use the AWS CLI:
+          aws s3 cp s3://{bucket_name}/{s3_key} .
           '''
-              
-              sns.publish(
-                  TopicArn=topic_arn,
-                  Subject=f'Patch Compliance Report: {patch_group or "All Instances"}',
-                  Message=message
-              )
+                  
+                  sns.publish(TopicArn=sns_topic_arn,
+                              Subject=f'Patch Compliance Report: {patch_group or "All Instances"}',
+                              Message=message)
+                  
+                  return {'statusCode': 200, 'body': {'message': 'Compliance report generated successfully',
+                          'filename': filename, 's3_location': f"s3://{bucket_name}/{s3_key}",
+                          'statistics': stats}}
+                  
+              except Exception as e:
+                  print(f"Error generating compliance report: {str(e)}")
+                  return {'statusCode': 500, 'body': {'error': str(e)}}
       Tags:
         - Key: DirectoryId
           Value: !Ref DirectoryId
@@ -742,6 +705,7 @@ Resources:
                   - workspaces:DescribeWorkspaces
                   - workspaces:DescribeWorkspaceDirectories
                   - workspaces:DescribeTags
+                  - tag:GetResources
                   - workspaces:StartWorkspaces
                   - workspaces:StopWorkspaces
                   - workspaces:RebootWorkspaces
@@ -757,6 +721,11 @@ Resources:
                   - logs:DescribeLogGroups
                   - logs:DescribeLogStreams
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${MaintenanceStateBucket}/maintenance-state/*'
               - Effect: Allow
                 Action: iam:PassRole
                 Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/WorkSpacesMaintenance-${DirectoryId}-Role'
@@ -1126,6 +1095,10 @@ Resources:
             allowedValues:
               - 'Yes'
               - 'No'
+          StateBucket:
+            type: String
+            description: (Required) S3 bucket name for storing automation state between steps
+            default: !Ref MaintenanceStateBucket
         mainSteps:
           - description: Gets a list of WorkSpaces excluding those tagged with 'Key:Patch Value:No'
             name: getWorkspaces
@@ -1139,196 +1112,96 @@ Resources:
                     import json
                     from datetime import datetime
                     
-                    # CloudWatch Logs helper function
                     def log_to_cloudwatch(log_group_name, message, log_stream_name=None):
                         try:
                             logs_client = boto3.client('logs')
-                            
                             if not log_stream_name:
                                 log_stream_name = "workspaces-maintenance-automation"
-                            
-                            # Try to create log stream (will fail silently if it exists)
                             try:
-                                logs_client.create_log_stream(
-                                    logGroupName=log_group_name,
-                                    logStreamName=log_stream_name
-                                )
+                                logs_client.create_log_stream(logGroupName=log_group_name, logStreamName=log_stream_name)
                             except logs_client.exceptions.ResourceAlreadyExistsException:
                                 pass
-                            
-                            # Put log event
                             logs_client.put_log_events(
-                                logGroupName=log_group_name,
-                                logStreamName=log_stream_name,
-                                logEvents=[
-                                    {
-                                        'timestamp': int(datetime.now().timestamp() * 1000),
-                                        'message': message
-                                    }
-                                ]
+                                logGroupName=log_group_name, logStreamName=log_stream_name,
+                                logEvents=[{'timestamp': int(datetime.now().timestamp() * 1000), 'message': message}]
                             )
                         except Exception as e:
                             print(f"Failed to log to CloudWatch: {str(e)}")
                     
                     workspaces = boto3.client('workspaces')
+                    s3 = boto3.client('s3')
                     directory_id = events.get('directoryId', '')
                     log_group_name = events.get('logGroupName', '')
+                    state_bucket = events.get('stateBucket', '')
+                    execution_id = events.get('executionId', '')
                     
                     if not directory_id:
                         raise Exception("DirectoryId parameter is required")
                     
+                    state_prefix = f"maintenance-state/{directory_id}/{execution_id}"
                     log_to_cloudwatch(log_group_name, f"Starting WorkSpaces discovery for Directory: {directory_id}")
                     
-                    def check_tags(workspace_id):
-                        try:
-                            response = workspaces.describe_tags(
-                                ResourceId=workspace_id
-                            )
-                            
-                            for tag in response['TagList']:
-                                if tag['Key'] == 'Patch' and tag['Value'] == 'No':
-                                    return False
-                            return True
-                        except Exception as e:
-                            print(f"Error checking tags for workspace {workspace_id}: {str(e)}")
-                            return True  # Default to including workspace if tag check fails
+                    # Batch-fetch all WorkSpace tags using Resource Groups Tagging API
+                    tagging = boto3.client('resourcegroupstaggingapi')
+                    excluded_ws_ids = set()
+                    tag_paginator = tagging.get_paginator('get_resources')
+                    for page in tag_paginator.paginate(
+                        ResourceTypeFilters=['workspaces:workspace'],
+                        TagFilters=[{'Key': 'Patch', 'Values': ['No']}]
+                    ):
+                        for resource in page['ResourceTagMappingList']:
+                            # ARN format: arn:aws:workspaces:region:account:workspace/ws-id
+                            ws_id = resource['ResourceARN'].split('/')[-1]
+                            excluded_ws_ids.add(ws_id)
                     
-                    def get_all_workspaces():
-                        workspace_info = []
-                        paginator = workspaces.get_paginator('describe_workspaces')
-                        
-                        try:
-                            # Filter WorkSpaces by DirectoryId
-                            paginator_args = {
-                                'DirectoryId': directory_id
-                            }
-                            
-                            for page in paginator.paginate(**paginator_args):
-                                for workspace in page['Workspaces']:
-                                    # Only include WorkSpaces that are not in PENDING or ERROR state
-                                    if workspace['State'] not in ['PENDING', 'ERROR']:
-                                        workspace_info.append({
-                                            'WorkspaceId': workspace['WorkspaceId'],
-                                            'ComputerName': workspace.get('ComputerName', ''),
-                                            'State': workspace['State'],
-                                            'RunningMode': workspace.get('WorkspaceProperties', {}).get('RunningMode', 'UNKNOWN')
-                                        })
-                            return workspace_info
-                            
-                        except Exception as e:
-                            error_msg = f"Error getting WorkSpaces list: {str(e)}"
-                            print(error_msg)
-                            log_to_cloudwatch(log_group_name, error_msg)
-                            raise Exception(f"Failed to retrieve WorkSpaces from Directory {directory_id}: {str(e)}")
+                    workspace_ids = []
+                    excluded_workspaces = []
+                    paginator = workspaces.get_paginator('describe_workspaces')
                     
-                    try:
-                        print(f"\nStarting WorkSpaces discovery for Directory: {directory_id}")
-                        all_workspaces = get_all_workspaces()
-                        
-                        if not all_workspaces:
-                            error_msg = f"No WorkSpaces found in Directory {directory_id} (Directory may be empty or all WorkSpaces are in PENDING/ERROR state)"
-                            log_to_cloudwatch(log_group_name, error_msg)
-                            raise Exception(error_msg)
-                        
-                        workspaces_to_process = []
-                        computer_names = []
-                        workspace_ids = []
-                        workspace_states = []
-                        workspace_modes = []
-                        excluded_workspaces = []
-                        
-                        # Process each workspace
-                        for workspace in all_workspaces:
-                            if check_tags(workspace['WorkspaceId']):
-                                workspace_ids.append(workspace['WorkspaceId'])
-                                computer_names.append(workspace['ComputerName'])
-                                workspace_states.append(workspace['State'])
-                                workspace_modes.append(workspace['RunningMode'])
-                                workspaces_to_process.append(json.dumps(workspace))
-                            else:
-                                excluded_workspaces.append(workspace['WorkspaceId'])
-                        
-                        if not workspace_ids:
-                            error_msg = (
-                                f"No eligible WorkSpaces found for patching in Directory {directory_id}. "
-                                f"All {len(excluded_workspaces)} WorkSpaces are tagged with 'Patch:No'"
-                                if excluded_workspaces
-                                else "No WorkSpaces available for patching."
-                            )
-                            log_to_cloudwatch(log_group_name, error_msg)
-                            raise Exception(error_msg)
-                        
-                        # Prepare summary
-                        workspace_count = str(len(workspace_ids))
-                        excluded_count = str(len(excluded_workspaces))
-                        
-                        summary_msg = f"WorkSpaces Discovery Summary for Directory {directory_id}: Total WorkSpaces found: {len(all_workspaces)}, Eligible for patching: {workspace_count}, Excluded from patching: {excluded_count}"
-                        
-                        print(f"\nWorkSpaces Summary for Directory {directory_id}:")
-                        print(f"----------------------------------------")
-                        print(f"Total WorkSpaces found: {len(all_workspaces)}")
-                        print(f"Eligible for patching: {workspace_count}")
-                        print(f"Excluded from patching: {excluded_count}")
-                        
-                        log_to_cloudwatch(log_group_name, summary_msg)
-                        
-                        if excluded_workspaces:
-                            excluded_msg = f"Excluded WorkSpaces (tagged with 'Patch:No'): {', '.join(excluded_workspaces)}"
-                            print(f"\nExcluded WorkSpaces (tagged with 'Patch:No'):")
-                            for workspace_id in excluded_workspaces:
-                                print(f"- WorkSpace ID: {workspace_id}")
-                            log_to_cloudwatch(log_group_name, excluded_msg)
-                        
-                        eligible_msg = f"WorkSpaces to be patched: {', '.join(workspace_ids)}"
-                        print(f"\nWorkSpaces to be patched:")
-                        for i, workspace_id in enumerate(workspace_ids):
-                            print(f"- WorkSpace ID: {workspace_id}")
-                            print(f"  Computer Name: {computer_names[i]}")
-                            print(f"  State: {workspace_states[i]}")
-                            print(f"  Running Mode: {workspace_modes[i]}")
-                        log_to_cloudwatch(log_group_name, eligible_msg)
-                        
-                        return {
-                            'workspaceIds': workspace_ids,
-                            'computerNames': computer_names,
-                            'workspaceStates': workspace_states,
-                            'workspaceModes': workspace_modes,
-                            'workspaceDetails': workspaces_to_process,
-                            'workspaceCount': workspace_count,
-                            'excludedWorkspaces': excluded_workspaces,
-                            'excludedCount': excluded_count,
-                            'directoryId': directory_id
-                        }
-                        
-                    except Exception as e:
-                        error_msg = f"Error in getWorkspaces step: {str(e)}"
-                        print(f"\n{error_msg}")
+                    for page in paginator.paginate(DirectoryId=directory_id):
+                        for ws in page['Workspaces']:
+                            if ws['State'] not in ['PENDING', 'ERROR']:
+                                if ws['WorkspaceId'] in excluded_ws_ids:
+                                    excluded_workspaces.append(ws['WorkspaceId'])
+                                else:
+                                    workspace_ids.append(ws['WorkspaceId'])
+                    
+                    if not workspace_ids:
+                        error_msg = f"No eligible WorkSpaces found for patching in Directory {directory_id}"
                         log_to_cloudwatch(log_group_name, error_msg)
-                        raise
+                        raise Exception(error_msg)
+                    
+                    workspace_count = str(len(workspace_ids))
+                    excluded_count = str(len(excluded_workspaces))
+                    
+                    # Store large lists in S3
+                    s3.put_object(
+                        Bucket=state_bucket,
+                        Key=f"{state_prefix}/workspaces.json",
+                        Body=json.dumps({'workspaceIds': workspace_ids, 'excludedWorkspaces': excluded_workspaces}),
+                        ServerSideEncryption='AES256'
+                    )
+                    
+                    summary_msg = f"Discovery for Directory {directory_id}: Eligible={workspace_count}, Excluded={excluded_count}"
+                    print(summary_msg)
+                    log_to_cloudwatch(log_group_name, summary_msg)
+                    
+                    return {
+                        'workspaceCount': workspace_count,
+                        'excludedCount': excluded_count,
+                        'directoryId': directory_id
+                    }
               Runtime: python3.11
               InputPayload:
                 directoryId: !Ref DirectoryId
                 logGroupName: '{{ CloudWatchLogGroupName }}'
+                stateBucket: '{{ StateBucket }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
             outputs:
-              - Type: StringList
-                Name: workspaceIds
-                Selector: $.Payload.workspaceIds
-              - Type: StringList
-                Name: computerNames
-                Selector: $.Payload.computerNames
-              - Type: StringList
-                Name: workspaceModes
-                Selector: $.Payload.workspaceModes
-              - Type: StringList
-                Name: workspaceDetails
-                Selector: $.Payload.workspaceDetails
               - Type: String
                 Name: workspaceCount
                 Selector: $.Payload.workspaceCount
-              - Type: StringList
-                Name: excludedWorkspaces
-                Selector: $.Payload.excludedWorkspaces
               - Type: String
                 Name: excludedCount
                 Selector: $.Payload.excludedCount
@@ -1347,47 +1220,45 @@ Resources:
                     import json
                     from datetime import datetime
                     
-                    # CloudWatch Logs helper function
                     def log_to_cloudwatch(log_group_name, message, log_stream_name=None):
                         try:
                             logs_client = boto3.client('logs')
-                            
                             if not log_stream_name:
                                 log_stream_name = "workspaces-maintenance-automation"
-                            
-                            # Try to create log stream (will fail silently if it exists)
                             try:
-                                logs_client.create_log_stream(
-                                    logGroupName=log_group_name,
-                                    logStreamName=log_stream_name
-                                )
+                                logs_client.create_log_stream(logGroupName=log_group_name, logStreamName=log_stream_name)
                             except logs_client.exceptions.ResourceAlreadyExistsException:
                                 pass
-                            
-                            # Put log event
                             logs_client.put_log_events(
-                                logGroupName=log_group_name,
-                                logStreamName=log_stream_name,
-                                logEvents=[
-                                    {
-                                        'timestamp': int(datetime.now().timestamp() * 1000),
-                                        'message': message
-                                    }
-                                ]
+                                logGroupName=log_group_name, logStreamName=log_stream_name,
+                                logEvents=[{'timestamp': int(datetime.now().timestamp() * 1000), 'message': message}]
                             )
                         except Exception as e:
                             print(f"Failed to log to CloudWatch: {str(e)}")
                     
                     ssm = boto3.client('ssm')
-                    workspaces = boto3.client('workspaces')
-                    computer_names = events['computerNames']
-                    workspace_ids = events['workspaceIds']
+                    ws_client = boto3.client('workspaces')
+                    s3 = boto3.client('s3')
+                    directory_id = events['directoryId']
                     log_group_name = events.get('logGroupName', '')
+                    state_bucket = events['stateBucket']
+                    execution_id = events['executionId']
+                    state_prefix = f"maintenance-state/{directory_id}/{execution_id}"
                     
-                    workspace_map = dict(zip(computer_names, workspace_ids))
+                    # Read workspace IDs from S3
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/workspaces.json")
+                    ws_data = json.loads(obj['Body'].read().decode('utf-8'))
+                    workspace_ids = ws_data['workspaceIds']
+                    
+                    # Build computer name map from WorkSpaces API
+                    computer_to_workspace = {}
+                    paginator_ws = ws_client.get_paginator('describe_workspaces')
+                    for page in paginator_ws.paginate(DirectoryId=directory_id):
+                        for ws in page['Workspaces']:
+                            if ws['WorkspaceId'] in workspace_ids:
+                                computer_to_workspace[ws.get('ComputerName', '')] = ws['WorkspaceId']
                     
                     instance_ids = []
-                    matched_instances = []
                     matched_workspace_ids = []
                     unmanaged_workspace_ids = workspace_ids.copy()
                     
@@ -1395,31 +1266,19 @@ Resources:
                     
                     def normalize_computer_name(name):
                         name = name.split('.')[0].lower()
-                        prefixes = ['a-', 'u-', 'r-', 'wsamzn-']
-                        for prefix in prefixes:
-                            if name.startswith(prefix):
-                                return name
                         return name
 
                     paginator = ssm.get_paginator('describe_instance_information')
-                    
                     for page in paginator.paginate():
                         for instance in page['InstanceInformationList']:
-                            ssm_computer_name = normalize_computer_name(instance.get('ComputerName', ''))
-                            for workspace_computer_name in computer_names:
-                                workspace_name = normalize_computer_name(workspace_computer_name)
-                                
-                                if ssm_computer_name == workspace_name:
+                            ssm_name = normalize_computer_name(instance.get('ComputerName', ''))
+                            for ws_name in computer_to_workspace:
+                                if ssm_name == normalize_computer_name(ws_name):
                                     instance_ids.append(instance['InstanceId'])
-                                    matched_instances.append(
-                                        f"Instance ID: {instance['InstanceId']}, "
-                                        f"Computer Name: {instance['ComputerName']}, "
-                                        f"Platform: {instance.get('PlatformType', 'Unknown')}"
-                                    )
-                                    workspace_id = workspace_map[workspace_computer_name]
-                                    matched_workspace_ids.append(workspace_id)
-                                    if workspace_id in unmanaged_workspace_ids:
-                                        unmanaged_workspace_ids.remove(workspace_id)
+                                    ws_id = computer_to_workspace[ws_name]
+                                    matched_workspace_ids.append(ws_id)
+                                    if ws_id in unmanaged_workspace_ids:
+                                        unmanaged_workspace_ids.remove(ws_id)
                                     break
                     
                     if not instance_ids:
@@ -1427,42 +1286,34 @@ Resources:
                         log_to_cloudwatch(log_group_name, error_msg)
                         raise Exception(error_msg)
                     
-                    ssm_summary = f"Found {len(instance_ids)} WorkSpaces managed by Systems Manager"
-                    print(f"Found {len(instance_ids)} WorkSpaces managed by Systems Manager:")
-                    for match in matched_instances:
-                        print(match)
+                    # Store large lists in S3
+                    s3.put_object(
+                        Bucket=state_bucket,
+                        Key=f"{state_prefix}/managed-instances.json",
+                        Body=json.dumps({
+                            'instanceIds': instance_ids,
+                            'matchedWorkspaceIds': matched_workspace_ids,
+                            'unmanagedWorkspaceIds': unmanaged_workspace_ids
+                        }),
+                        ServerSideEncryption='AES256'
+                    )
+                    
+                    ssm_summary = f"Found {len(instance_ids)} managed, {len(unmanaged_workspace_ids)} unmanaged"
+                    print(ssm_summary)
                     log_to_cloudwatch(log_group_name, ssm_summary)
                     
-                    if unmanaged_workspace_ids:
-                        unmanaged_msg = f"Warning: Found {len(unmanaged_workspace_ids)} WorkSpaces not managed by Systems Manager: {', '.join(unmanaged_workspace_ids)}"
-                        print(f"\nWarning: Found {len(unmanaged_workspace_ids)} WorkSpaces not managed by Systems Manager:")
-                        for workspace_id in unmanaged_workspace_ids:
-                            print(f"WorkSpace ID: {workspace_id}")
-                        log_to_cloudwatch(log_group_name, unmanaged_msg)
-                    
                     return {
-                        'instanceIds': instance_ids,
-                        'matchedWorkspaceIds': matched_workspace_ids,
-                        'unmanagedWorkspaceIds': unmanaged_workspace_ids,
                         'unmanagedCount': len(unmanaged_workspace_ids),
                         'matchedWorkspacesCount': str(len(matched_workspace_ids))
                     }
               Runtime: python3.11
               InputPayload:
-                computerNames: '{{ getWorkspaces.computerNames }}'
-                workspaceIds: '{{ getWorkspaces.workspaceIds }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
                 logGroupName: '{{ CloudWatchLogGroupName }}'
+                stateBucket: '{{ StateBucket }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
             outputs:
-              - Type: StringList
-                Name: instanceIds
-                Selector: $.Payload.instanceIds
-              - Type: StringList
-                Name: matchedWorkspaceIds
-                Selector: $.Payload.matchedWorkspaceIds
-              - Type: StringList
-                Name: unmanagedWorkspaceIds
-                Selector: $.Payload.unmanagedWorkspaceIds
               - Type: String
                 Name: unmanagedCount
                 Selector: $.Payload.unmanagedCount
@@ -1479,43 +1330,46 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                     import boto3
+                    import json
                     from time import sleep
                     
+                    s3 = boto3.client('s3')
                     workspaces = boto3.client('workspaces')
-                    workspace_ids = events['matchedWorkspaceIds']
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
+                    
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    data = json.loads(obj['Body'].read().decode('utf-8'))
+                    workspace_ids = data['matchedWorkspaceIds']
                     batch_size = 25
                     
                     for i in range(0, len(workspace_ids), batch_size):
                         batch = workspace_ids[i:i + batch_size]
-                        
                         try:
                             response = workspaces.start_workspaces(
-                                StartWorkspaceRequests=[
-                                    {'WorkspaceId': w_id} for w_id in batch
-                                ]
+                                StartWorkspaceRequests=[{'WorkspaceId': w_id} for w_id in batch]
                             )
-                            
                             if response['FailedRequests']:
                                 print(f"Failed requests: {response['FailedRequests']}")
-                            
                             sleep(2)
-                            
                         except Exception as e:
                             print(f"Error processing batch: {str(e)}")
                     
                     return {'StatusCode': 200, 'Message': 'WorkSpace start operations completed'}
               Runtime: python3.11
               InputPayload:
-                matchedWorkspaceIds: '{{ getManagedInstances.matchedWorkspaceIds }}'
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
 
-          - description: Wait 4 minutes to allow the WorkSpaces to resume from hibernation
+          - description: Wait 5 minutes to allow the WorkSpaces to resume from hibernation
             name: waitForResume
             action: aws:sleep
             nextStep: branchRebootWorkspaces
             isEnd: false
             inputs:
-              Duration: PT4M
+              Duration: PT5M
 
           - name: branchRebootWorkspaces
             action: aws:branch
@@ -1535,47 +1389,47 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                     import boto3
+                    import json
                     from time import sleep
                     
+                    s3 = boto3.client('s3')
                     workspaces = boto3.client('workspaces')
-                    workspace_ids = events['matchedWorkspaceIds']
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
+                    
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    data = json.loads(obj['Body'].read().decode('utf-8'))
+                    workspace_ids = data['matchedWorkspaceIds']
                     batch_size = 25
                     
                     print(f"Initiating reboot for {len(workspace_ids)} WorkSpaces...")
-                    
                     for i in range(0, len(workspace_ids), batch_size):
                         batch = workspace_ids[i:i + batch_size]
-                        
                         try:
                             response = workspaces.reboot_workspaces(
-                                RebootWorkspaceRequests=[
-                                    {'WorkspaceId': w_id} for w_id in batch
-                                ]
+                                RebootWorkspaceRequests=[{'WorkspaceId': w_id} for w_id in batch]
                             )
-                            
                             if response['FailedRequests']:
                                 print(f"Failed reboot requests: {response['FailedRequests']}")
-                            else:
-                                print(f"Successfully initiated reboot for batch: {batch}")
-                            
                             sleep(2)
-                            
                         except Exception as e:
                             print(f"Error processing reboot batch: {str(e)}")
                     
                     return {'StatusCode': 200, 'Message': 'WorkSpace reboot operations completed'}
               Runtime: python3.11
               InputPayload:
-                matchedWorkspaceIds: '{{ getManagedInstances.matchedWorkspaceIds }}'
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
 
-          - description: Wait 5 minutes after reboot to allow WorkSpaces to fully restart
+          - description: Wait 8 minutes after reboot to allow WorkSpaces to fully restart
             name: waitForReboot
             action: aws:sleep
             nextStep: enableAdminMaintenance
             isEnd: false
             inputs:
-              Duration: PT5M
+              Duration: PT8M
           - description: Place the managed WorkSpaces into manual maintenance mode (ADMIN_MAINTENANCE)
             name: enableAdminMaintenance
             action: aws:executeScript
@@ -1585,25 +1439,29 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                     import boto3
+                    import json
                     
+                    s3 = boto3.client('s3')
                     workspaces = boto3.client('workspaces')
-                    workspace_ids = events['matchedWorkspaceIds']
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
                     
-                    for workspace_id in workspace_ids:
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    data = json.loads(obj['Body'].read().decode('utf-8'))
+                    
+                    for workspace_id in data['matchedWorkspaceIds']:
                         try:
-                            response = workspaces.modify_workspace_state(
-                                WorkspaceId=str(workspace_id),
-                                WorkspaceState='ADMIN_MAINTENANCE'
-                            )
+                            workspaces.modify_workspace_state(WorkspaceId=str(workspace_id), WorkspaceState='ADMIN_MAINTENANCE')
                             print(f"Set WorkSpace {workspace_id} to ADMIN_MAINTENANCE")
-                            
                         except Exception as e:
                             print(f"Error processing workspace {workspace_id}: {str(e)}")
                     
                     return {'StatusCode': 200, 'Message': 'WorkSpace ADMIN_MAINTENANCE operations completed'}
               Runtime: python3.11
               InputPayload:
-                matchedWorkspaceIds: '{{ getManagedInstances.matchedWorkspaceIds }}'
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
 
           - description: Verify all managed WorkSpace instances are reporting as online in Systems Manager, proceeds after 10min regardless
@@ -1618,110 +1476,77 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                     import boto3
+                    import json
                     import time
                     from datetime import datetime, timedelta
                     
-                    def make_api_call_with_retry(ssm_client, instance_ids, max_retries=3):
-                        for attempt in range(max_retries):
-                            try:
-                                return ssm_client.describe_instance_information(
-                                    InstanceInformationFilterList=[
-                                        {
-                                            'key': 'InstanceIds',
-                                            'valueSet': instance_ids
-                                        }
-                                    ]
-                                )
-                            except Exception as e:
-                                if attempt == max_retries - 1:
-                                    raise
-                                time.sleep(2 ** attempt)
-                    
+                    s3 = boto3.client('s3')
                     ssm = boto3.client('ssm')
-                    instance_ids = events['instanceIds']
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
+                    
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    data = json.loads(obj['Body'].read().decode('utf-8'))
+                    instance_ids = data['instanceIds']
+                    
+                    def describe_instances_batched(ids):
+                        """DescribeInstanceInformation limits valueSet to 100 items"""
+                        all_instances = []
+                        for i in range(0, len(ids), 100):
+                            batch = ids[i:i + 100]
+                            resp = ssm.describe_instance_information(
+                                InstanceInformationFilterList=[{'key': 'InstanceIds', 'valueSet': batch}]
+                            )
+                            all_instances.extend(resp['InstanceInformationList'])
+                        return all_instances
+                    
                     timeout = datetime.now() + timedelta(minutes=10)
+                    online_count = 0
+                    offline_instances = []
                     
                     while datetime.now() < timeout:
                         try:
-                            response = make_api_call_with_retry(ssm, instance_ids)
+                            all_info = describe_instances_batched(instance_ids)
                             
-                            connection_states = {
-                                'Online': [],
-                                'ConnectionLost': [],
-                                'Inactive': [],
-                                'NotFound': []
-                            }
+                            online_count = sum(1 for i in all_info if i['PingStatus'] == 'Online')
+                            found_ids = {i['InstanceId'] for i in all_info}
                             
-                            remaining_instances = set(instance_ids)
+                            offline_instances = []
+                            for i in all_info:
+                                if i['PingStatus'] != 'Online':
+                                    offline_instances.append(f"{i['InstanceId']}: {i['PingStatus']}")
+                            for iid in instance_ids:
+                                if iid not in found_ids:
+                                    offline_instances.append(f"{iid}: Not Found in SSM")
                             
-                            for instance in response['InstanceInformationList']:
-                                instance_id = instance['InstanceId']
-                                ping_status = instance['PingStatus']
-                                platform = instance.get('PlatformType', 'Unknown')
-                                ip_address = instance.get('IPAddress', 'Unknown')
-                                
-                                instance_info = f"{instance_id}: {ping_status} (Platform: {platform}, IP: {ip_address})"
-                                
-                                if ping_status == 'Online':
-                                    connection_states['Online'].append(instance_info)
-                                elif ping_status == 'ConnectionLost':
-                                    connection_states['ConnectionLost'].append(instance_info)
-                                elif ping_status == 'Inactive':
-                                    connection_states['Inactive'].append(instance_info)
-                                    
-                                remaining_instances.discard(instance_id)
-                            
-                            for instance_id in remaining_instances:
-                                connection_states['NotFound'].append(f"{instance_id}: Not Found in SSM")
-                            
-                            online_count = len(connection_states['Online'])
-                            offline_instances = (
-                                connection_states['ConnectionLost'] +
-                                connection_states['Inactive'] +
-                                connection_states['NotFound']
-                            )
-                            
-                            print(f"\nInstance Status Summary:")
-                            print(f"Online: {len(connection_states['Online'])}")
-                            print(f"Connection Lost: {len(connection_states['ConnectionLost'])}")
-                            print(f"Inactive: {len(connection_states['Inactive'])}")
-                            print(f"Not Found: {len(connection_states['NotFound'])}")
-                            
-                            if offline_instances:
-                                print("\nOffline/Not responding instances:")
-                                for instance in offline_instances:
-                                    print(instance)
+                            print(f"Online: {online_count}, Offline: {len(offline_instances)}")
                             
                             if online_count == len(instance_ids):
-                                print("\nAll instances are online and reporting to Systems Manager")
-                                return {
-                                    'StatusCode': 200,
-                                    'Message': 'All instances online',
-                                    'OnlineCount': online_count,
-                                    'OfflineCount': len(offline_instances),
-                                    'OfflineInstances': offline_instances,
-                                    'ConnectionStates': connection_states
-                                }
+                                print("All instances are online")
+                                break
                             
-                            print("\nWaiting 30 seconds before next check...")
                             time.sleep(30)
-                            
                         except Exception as e:
                             print(f"Error checking instance status: {str(e)}")
                             time.sleep(30)
                     
-                    print("\nTimeout reached. Not all instances are reporting as online.")
+                    # Store offline instances in S3
+                    s3.put_object(
+                        Bucket=state_bucket,
+                        Key=f"{state_prefix}/ping-status.json",
+                        Body=json.dumps({'offlineInstances': offline_instances}),
+                        ServerSideEncryption='AES256'
+                    )
+                    
                     return {
-                        'StatusCode': 200,
-                        'Message': 'Verification timed out - continuing with available instances',
-                        'OnlineCount': online_count,
-                        'OfflineCount': len(offline_instances),
-                        'OfflineInstances': offline_instances,
-                        'ConnectionStates': connection_states
+                        'OnlineCount': str(online_count),
+                        'OfflineCount': str(len(offline_instances))
                     }
               Runtime: python3.11
               InputPayload:
-                instanceIds: '{{ getManagedInstances.instanceIds }}'
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
             outputs:
               - Type: String
@@ -1730,9 +1555,6 @@ Resources:
               - Type: String
                 Name: offlineCount
                 Selector: $.Payload.OfflineCount
-              - Type: StringList
-                Name: offlineInstances
-                Selector: $.Payload.OfflineInstances
 
           - name: getDirectoryTenancy
             action: aws:executeAwsApi
@@ -1761,76 +1583,155 @@ Resources:
               Default: patchInstances
 
           - name: patchBYOL
-            action: aws:runCommand
+            action: aws:executeScript
             nextStep: postPatchScanBYOL
             isCritical: false
             isEnd: false
             onFailure: Continue
             inputs:
-              DocumentName: AWS-InstallWindowsUpdates
-              Parameters:
-                Action:
-                  - '{{ Action }}'
-                ExcludeKbs:
-                  - '{{ ExcludeKBs }}'
-              InstanceIds: '{{ getManagedInstances.instanceIds }}'
-              MaxConcurrency: 100%
-              MaxErrors: 100%
-              CloudWatchOutputConfig:
-                CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
-                CloudWatchOutputEnabled: true
+              Script: |-
+                def script_handler(events, context):
+                    import boto3, json
+                    
+                    s3 = boto3.client('s3')
+                    ssm = boto3.client('ssm')
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
+                    
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    instance_ids = json.loads(obj['Body'].read().decode('utf-8'))['instanceIds']
+                    
+                    # send_command supports up to 50 instance IDs per call
+                    command_ids = []
+                    for i in range(0, len(instance_ids), 50):
+                        batch = instance_ids[i:i + 50]
+                        resp = ssm.send_command(
+                            InstanceIds=batch,
+                            DocumentName='AWS-InstallWindowsUpdates',
+                            Parameters={'Action': [events['action']], 'ExcludeKbs': [events['excludeKBs']]},
+                            MaxConcurrency='100%', MaxErrors='100%',
+                            CloudWatchOutputConfig={'CloudWatchLogGroupName': events['logGroup'], 'CloudWatchOutputEnabled': True}
+                        )
+                        command_ids.append(resp['Command']['CommandId'])
+                    
+                    s3.put_object(
+                        Bucket=state_bucket, Key=f"{state_prefix}/patch-command-ids.json",
+                        Body=json.dumps({'commandIds': command_ids}), ServerSideEncryption='AES256'
+                    )
+                    return {'commandCount': str(len(command_ids))}
+              Runtime: python3.11
+              InputPayload:
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
+                action: '{{ Action }}'
+                excludeKBs: '{{ ExcludeKBs }}'
+                logGroup: '{{ CloudWatchLogGroupName }}'
+              Handler: script_handler
             outputs:
               - Type: String
-                Name: commandId
-                Selector: $.CommandId
+                Name: commandCount
+                Selector: $.Payload.commandCount
 
           - name: postPatchScanBYOL
-            action: aws:runCommand
+            action: aws:executeScript
             nextStep: monitorPatchStatus
             isCritical: false
             isEnd: false
             onFailure: Continue
             inputs:
-              DocumentName: AWS-RunPatchBaseline
-              Parameters:
-                Operation:
-                  - Scan
-                RebootOption:
-                  - NoReboot
-              InstanceIds: '{{ getManagedInstances.instanceIds }}'
-              MaxConcurrency: 100%
-              MaxErrors: 100%
-              CloudWatchOutputConfig:
-                CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
-                CloudWatchOutputEnabled: true
+              Script: |-
+                def script_handler(events, context):
+                    import boto3, json
+                    
+                    s3 = boto3.client('s3')
+                    ssm = boto3.client('ssm')
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
+                    
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    instance_ids = json.loads(obj['Body'].read().decode('utf-8'))['instanceIds']
+                    
+                    command_ids = []
+                    for i in range(0, len(instance_ids), 50):
+                        batch = instance_ids[i:i + 50]
+                        resp = ssm.send_command(
+                            InstanceIds=batch,
+                            DocumentName='AWS-RunPatchBaseline',
+                            Parameters={'Operation': ['Scan'], 'RebootOption': ['NoReboot']},
+                            MaxConcurrency='100%', MaxErrors='100%',
+                            CloudWatchOutputConfig={'CloudWatchLogGroupName': events['logGroup'], 'CloudWatchOutputEnabled': True}
+                        )
+                        command_ids.append(resp['Command']['CommandId'])
+                    
+                    # Overwrite with scan command IDs (these are the ones we monitor)
+                    s3.put_object(
+                        Bucket=state_bucket, Key=f"{state_prefix}/patch-command-ids.json",
+                        Body=json.dumps({'commandIds': command_ids}), ServerSideEncryption='AES256'
+                    )
+                    return {'commandCount': str(len(command_ids))}
+              Runtime: python3.11
+              InputPayload:
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
+                logGroup: '{{ CloudWatchLogGroupName }}'
+              Handler: script_handler
             outputs:
               - Type: String
-                Name: scanCommandId
-                Selector: $.CommandId
+                Name: commandCount
+                Selector: $.Payload.commandCount
+
           - description: Patch the WorkSpaces using AWS-RunPatchBaseline
             name: patchInstances
-            action: aws:runCommand
+            action: aws:executeScript
             nextStep: monitorPatchStatus
             isCritical: false
             isEnd: false
             onFailure: Continue
             inputs:
-              DocumentName: AWS-RunPatchBaseline
-              Parameters:
-                Operation:
-                  - '{{ Action }}'
-                RebootOption:
-                  - '{{ AllowReboot }}'
-              InstanceIds: '{{ getManagedInstances.instanceIds }}'
-              MaxConcurrency: 100%
-              MaxErrors: 100%
-              CloudWatchOutputConfig:
-                CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
-                CloudWatchOutputEnabled: true
+              Script: |-
+                def script_handler(events, context):
+                    import boto3, json
+                    
+                    s3 = boto3.client('s3')
+                    ssm = boto3.client('ssm')
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
+                    
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    instance_ids = json.loads(obj['Body'].read().decode('utf-8'))['instanceIds']
+                    
+                    command_ids = []
+                    for i in range(0, len(instance_ids), 50):
+                        batch = instance_ids[i:i + 50]
+                        resp = ssm.send_command(
+                            InstanceIds=batch,
+                            DocumentName='AWS-RunPatchBaseline',
+                            Parameters={'Operation': [events['action']], 'RebootOption': [events['rebootOption']]},
+                            MaxConcurrency='100%', MaxErrors='100%',
+                            CloudWatchOutputConfig={'CloudWatchLogGroupName': events['logGroup'], 'CloudWatchOutputEnabled': True}
+                        )
+                        command_ids.append(resp['Command']['CommandId'])
+                    
+                    s3.put_object(
+                        Bucket=state_bucket, Key=f"{state_prefix}/patch-command-ids.json",
+                        Body=json.dumps({'commandIds': command_ids}), ServerSideEncryption='AES256'
+                    )
+                    return {'commandCount': str(len(command_ids))}
+              Runtime: python3.11
+              InputPayload:
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
+                action: '{{ Action }}'
+                rebootOption: '{{ AllowReboot }}'
+                logGroup: '{{ CloudWatchLogGroupName }}'
+              Handler: script_handler
             outputs:
               - Type: String
-                Name: commandId
-                Selector: $.CommandId
+                Name: commandCount
+                Selector: $.Payload.commandCount
 
           - name: monitorPatchStatus
             action: aws:loop
@@ -1850,105 +1751,69 @@ Resources:
                   inputs:
                     Script: |
                       def script_handler(events, context):
-                          import boto3
-                          import time
-                          import re
+                          import boto3, json, time
                           
+                          s3 = boto3.client('s3')
                           ssm = boto3.client('ssm')
-                          command_id_byol = events.get('commandIdBYOL', '')
-                          command_id_instances = events.get('commandIdInstances', '')
-                          directory_tenancy = events.get('directoryTenancy', 'SHARED')
-                          instance_ids = events['instanceIds']
+                          state_bucket = events['stateBucket']
+                          state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
                           
-                          # Determine which command ID to use based on tenancy
-                          if directory_tenancy == 'DEDICATED':
-                              command_id = command_id_byol
-                              print(f"Using BYOL command ID for DEDICATED tenancy: {command_id}")
-                          else:
-                              command_id = command_id_instances  
-                              print(f"Using standard command ID for SHARED tenancy: {command_id}")
+                          obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/patch-command-ids.json")
+                          command_ids = json.loads(obj['Body'].read().decode('utf-8'))['commandIds']
                           
-                          # Simple cleanup - just use the command ID as-is if it looks valid
-                          command_id = command_id.strip()
+                          all_completed = True
+                          total_success = 0
+                          total_failed = 0
+                          status_list = []
                           
-                          # Basic validation - command IDs are typically UUIDs
-                          if len(command_id) > 30 and '-' in command_id:
-                              print(f"Using command ID: {command_id}")
-                          else:
-                              raise Exception(f"Invalid command ID format: {command_id}")
+                          for command_id in command_ids:
+                              try:
+                                  cmd_resp = ssm.list_commands(CommandId=command_id)
+                                  if not cmd_resp['Commands']:
+                                      status_list.append(f"Command {command_id}: NotFound")
+                                      continue
+                                  
+                                  cmd_status = cmd_resp['Commands'][0]['Status']
+                                  if cmd_status in ['Pending', 'InProgress']:
+                                      all_completed = False
+                                  
+                                  paginator = ssm.get_paginator('list_command_invocations')
+                                  for page in paginator.paginate(CommandId=command_id, Details=False):
+                                      for inv in page['CommandInvocations']:
+                                          status = inv['Status']
+                                          if status == 'Success':
+                                              total_success += 1
+                                          elif status in ['Failed', 'Cancelled', 'TimedOut']:
+                                              total_failed += 1
+                                          status_list.append(f"Instance {inv['InstanceId']}: {status}")
+                              except Exception as e:
+                                  print(f"Error checking command {command_id}: {str(e)}")
+                                  all_completed = False
                           
-                          try:
-                              command_response = ssm.list_commands(
-                                  CommandId=command_id
-                              )
-                              
-                              if command_response['Commands']:
-                                  command = command_response['Commands'][0]
-                                  command_status = command['Status']
-                                  print(f"Command status: {command_status}")
-                                  
-                                  invocations = ssm.list_command_invocations(
-                                      CommandId=command_id,
-                                      Details=False
-                                  )
-                                  
-                                  status_list = []
-                                  success_count = 0
-                                  failed_count = 0
-                                  
-                                  for invocation in invocations['CommandInvocations']:
-                                      instance_id = invocation['InstanceId']
-                                      status = invocation['Status']
-                                      
-                                      status_detail = f"Instance {instance_id}: {status}"
-                                      
-                                      if status == 'Success':
-                                          success_count += 1
-                                      elif status in ['Failed', 'Cancelled', 'TimedOut']:
-                                          failed_count += 1
-                                      
-                                      status_list.append(status_detail)
-                                  
-                                  if command_status in ['Pending', 'InProgress']:
-                                      completed = False
-                                  else:
-                                      completed = True
-                                  
-                                  return {
-                                      'StatusCode': 200,
-                                      'completed': completed,
-                                      'status': command_status,
-                                      'finalStatus': status_list,
-                                      'successCount': str(success_count),
-                                      'failedCount': str(failed_count)
-                                  }
-                              else:
-                                  print(f"No command found with ID: {command_id}")
-                                  return {
-                                      'StatusCode': 400,
-                                      'completed': True,
-                                      'status': 'NotFound',
-                                      'finalStatus': ['Command not found'],
-                                      'successCount': '0',
-                                      'failedCount': str(len(instance_ids))
-                                  }
-                          except Exception as e:
-                              print(f"Error checking command status: {str(e)}")
-                              raise
-                          finally:
-                              print("Waiting 120 seconds before next check...")
-                              time.sleep(120)
+                          # Store detailed status in S3 (can be large)
+                          s3.put_object(
+                              Bucket=state_bucket, Key=f"{state_prefix}/patch-status-detail.json",
+                              Body=json.dumps({'finalStatus': status_list}), ServerSideEncryption='AES256'
+                          )
+                          
+                          print(f"Completed: {all_completed}, Success: {total_success}, Failed: {total_failed}")
+                          
+                          if not all_completed:
+                              print("Waiting 5 min before next check...")
+                              time.sleep(300)
+                          
+                          return {
+                              'completed': all_completed,
+                              'successCount': str(total_success),
+                              'failedCount': str(total_failed)
+                          }
                     Runtime: python3.11
                     InputPayload:
-                      instanceIds: '{{ getManagedInstances.instanceIds }}'
-                      commandIdBYOL: '{{ patchBYOL.commandId }}'
-                      commandIdInstances: '{{ patchInstances.commandId }}'
-                      directoryTenancy: '{{ getDirectoryTenancy.Tenancy }}'
+                      stateBucket: '{{ StateBucket }}'
+                      directoryId: '{{ getWorkspaces.directoryId }}'
+                      executionId: '{{ automation:EXECUTION_ID }}'
                     Handler: script_handler
                   outputs:
-                    - Type: StringList
-                      Name: finalStatus
-                      Selector: $.Payload.finalStatus
                     - Type: String
                       Name: successCount
                       Selector: $.Payload.successCount
@@ -1958,9 +1823,6 @@ Resources:
                     - Type: Boolean
                       Name: completed
                       Selector: $.Payload.completed
-                    - Type: String
-                      Name: status
-                      Selector: $.Payload.status
 
           - name: branchDriverUpdate
             action: aws:branch
@@ -1973,31 +1835,75 @@ Resources:
 
           - description: Installs the AWS Elastic Network Adapter (ENA) driver for Windows.
             name: installAWSENADriver
-            action: aws:runCommand
+            action: aws:executeScript
             nextStep: installAWSNVMeDriver
             isCritical: false
             isEnd: false
             onFailure: Continue
             inputs:
-              DocumentName: !Ref ENADriverDocument
-              InstanceIds: '{{ getManagedInstances.instanceIds }}'
-              CloudWatchOutputConfig:
-                CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
-                CloudWatchOutputEnabled: true
+              Script: |-
+                def script_handler(events, context):
+                    import boto3, json
+                    
+                    s3 = boto3.client('s3')
+                    ssm = boto3.client('ssm')
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
+                    
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    instance_ids = json.loads(obj['Body'].read().decode('utf-8'))['instanceIds']
+                    
+                    for i in range(0, len(instance_ids), 50):
+                        batch = instance_ids[i:i + 50]
+                        ssm.send_command(
+                            InstanceIds=batch, DocumentName=events['documentName'],
+                            CloudWatchOutputConfig={'CloudWatchLogGroupName': events['logGroup'], 'CloudWatchOutputEnabled': True}
+                        )
+                    return {'StatusCode': 200}
+              Runtime: python3.11
+              InputPayload:
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
+                documentName: !Sub 'WorkSpaces-InstallENADriver-${DirectoryId}'
+                logGroup: '{{ CloudWatchLogGroupName }}'
+              Handler: script_handler
 
           - description: Installs the AWS NVMe driver for Windows.
             name: installAWSNVMeDriver
-            action: aws:runCommand
+            action: aws:executeScript
             nextStep: recordPatchResults
             isCritical: false
             isEnd: false
             onFailure: Continue
             inputs:
-              DocumentName: !Ref NVMeDriverDocument
-              InstanceIds: '{{ getManagedInstances.instanceIds }}'
-              CloudWatchOutputConfig:
-                CloudWatchLogGroupName: '{{ CloudWatchLogGroupName }}'
-                CloudWatchOutputEnabled: true
+              Script: |-
+                def script_handler(events, context):
+                    import boto3, json
+                    
+                    s3 = boto3.client('s3')
+                    ssm = boto3.client('ssm')
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
+                    
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    instance_ids = json.loads(obj['Body'].read().decode('utf-8'))['instanceIds']
+                    
+                    for i in range(0, len(instance_ids), 50):
+                        batch = instance_ids[i:i + 50]
+                        ssm.send_command(
+                            InstanceIds=batch, DocumentName=events['documentName'],
+                            CloudWatchOutputConfig={'CloudWatchLogGroupName': events['logGroup'], 'CloudWatchOutputEnabled': True}
+                        )
+                    return {'StatusCode': 200}
+              Runtime: python3.11
+              InputPayload:
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
+                documentName: !Sub 'WorkSpaces-InstallNVMeDriver-${DirectoryId}'
+                logGroup: '{{ CloudWatchLogGroupName }}'
+              Handler: script_handler
 
 
 
@@ -2010,20 +1916,15 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                     return {
-                        'finalStatus': events['finalStatus'],
                         'successCount': events['successCount'],
                         'failedCount': events['failedCount']
                     }
               Runtime: python3.11
               InputPayload:
                 failedCount: '{{ currentPatchStatus.failedCount }}'
-                finalStatus: '{{ currentPatchStatus.finalStatus }}'
                 successCount: '{{ currentPatchStatus.successCount }}'
               Handler: script_handler
             outputs:
-              - Type: StringList
-                Name: finalStatus
-                Selector: $.Payload.finalStatus
               - Type: String
                 Name: successCount
                 Selector: $.Payload.successCount
@@ -2033,6 +1934,7 @@ Resources:
 
           - name: getPostPatchDetails
             action: aws:executeScript
+            timeoutSeconds: 900
             nextStep: disableAdminMaintenance
             isCritical: false
             isEnd: false
@@ -2040,222 +1942,113 @@ Resources:
             inputs:
               Script: |-
                 def script_handler(events, context):
-                    import boto3
-                    import json
-                    from datetime import datetime
+                    import boto3, json, time
                     
+                    s3 = boto3.client('s3')
                     ssm = boto3.client('ssm')
-                    instance_ids = events['instanceIds']
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
                     
+                    obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                    instance_ids = json.loads(obj['Body'].read().decode('utf-8'))['instanceIds']
+                    
+                    # Batch-fetch all instance info (100 per call limit)
+                    instance_map = {}
+                    for i in range(0, len(instance_ids), 100):
+                        batch = instance_ids[i:i + 100]
+                        resp = ssm.describe_instance_information(
+                            InstanceInformationFilterList=[{'key': 'InstanceIds', 'valueSet': batch}]
+                        )
+                        for inst in resp['InstanceInformationList']:
+                            instance_map[inst['InstanceId']] = {
+                                'os': f"{inst.get('PlatformName', 'Unknown')} {inst.get('PlatformVersion', '')}".strip(),
+                                'platform': inst.get('PlatformType', 'Unknown').lower()
+                            }
+                    
+                    # Group instances by platform
+                    windows_ids = [iid for iid in instance_ids if instance_map.get(iid, {}).get('platform') == 'windows']
+                    linux_ids = [iid for iid in instance_ids if instance_map.get(iid, {}).get('platform') == 'linux']
+                    
+                    WIN_SCRIPT = 'try { $u = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1; if ($u) { $d = if ($u.InstalledOn) { $u.InstalledOn.ToString("yyyy-MM-dd HH:mm:ss") } else { "Unknown" }; Write-Output "KB:$($u.HotFixID)|Date:$d" } else { Write-Output "KB:None|Date:Unknown" } } catch { Write-Output "KB:Error|Date:Unknown" }'
+                    LINUX_SCRIPT = '#!/bin/bash\nif command -v rpm &>/dev/null; then rpm -qa --last 2>/dev/null | head -1 | awk \'{print "Package:"$1"|Date:"$2" "$3" "$4}\'; elif [ -f /var/log/dpkg.log ]; then tail -1 /var/log/dpkg.log | awk \'{print "Package:"$4"|Date:"$1" "$2}\'; else echo "Package:Unknown|Date:Unknown"; fi'
+                    
+                    # Send bulk commands per platform (50 per send_command call)
+                    command_ids = []
+                    
+                    def send_bulk(ids, doc_name, script):
+                        cids = []
+                        for i in range(0, len(ids), 50):
+                            batch = ids[i:i + 50]
+                            resp = ssm.send_command(
+                                InstanceIds=batch, DocumentName=doc_name,
+                                Parameters={'commands': [script]}, TimeoutSeconds=60
+                            )
+                            cids.append(resp['Command']['CommandId'])
+                        return cids
+                    
+                    if windows_ids:
+                        command_ids.extend(send_bulk(windows_ids, 'AWS-RunPowerShellScript', WIN_SCRIPT))
+                    if linux_ids:
+                        command_ids.extend(send_bulk(linux_ids, 'AWS-RunShellScript', LINUX_SCRIPT))
+                    
+                    # Wait for all commands to complete
+                    if command_ids:
+                        time.sleep(30)
+                        for _ in range(12):
+                            all_done = True
+                            for cid in command_ids:
+                                resp = ssm.list_commands(CommandId=cid)
+                                if resp['Commands'] and resp['Commands'][0]['Status'] in ['Pending', 'InProgress']:
+                                    all_done = False
+                                    break
+                            if all_done:
+                                break
+                            time.sleep(10)
+                    
+                    # Collect results
                     post_patch_details = []
+                    for cid in command_ids:
+                        paginator = ssm.get_paginator('list_command_invocations')
+                        for page in paginator.paginate(CommandId=cid, Details=True):
+                            for inv in page['CommandInvocations']:
+                                iid = inv['InstanceId']
+                                info = instance_map.get(iid, {'os': 'Unknown', 'platform': 'unknown'})
+                                output = ''
+                                for plugin in inv.get('CommandPlugins', []):
+                                    output = plugin.get('Output', '').strip()
+                                
+                                latest = 'No update information available'
+                                if inv['Status'] == 'Success' and output:
+                                    parts = {p.split(':',1)[0]: p.split(':',1)[1] for p in output.split('|') if ':' in p}
+                                    name = parts.get('KB') or parts.get('Package') or ''
+                                    date = parts.get('Date', '')
+                                    if name:
+                                        latest = f"{name} installed on {date}" if date else name
+                                
+                                post_patch_details.append(f"Instance {iid}:\nOperating System: {info['os']}\nLatest Update: {latest}")
                     
-                    for instance_id in instance_ids:
-                        try:
-                            # Get operating system information
-                            instance_info = ssm.describe_instance_information(
-                                InstanceInformationFilterList=[
-                                    {
-                                        'key': 'InstanceIds',
-                                        'valueSet': [instance_id]
-                                    }
-                                ]
-                            )
-                            
-                            os_info = "Unknown"
-                            platform_type = "Unknown"
-                            if instance_info['InstanceInformationList']:
-                                instance_data = instance_info['InstanceInformationList'][0]
-                                platform_name = instance_data.get('PlatformName', 'Unknown')
-                                platform_version = instance_data.get('PlatformVersion', '')
-                                platform_type = instance_data.get('PlatformType', 'Unknown')
-                                os_info = f"{platform_name} {platform_version}".strip()
-                            
-                            # Determine the appropriate command based on platform type
-                            if platform_type.lower() == 'windows':
-                                # Windows PowerShell command
-                                command_script = '''
-                                try {
-                                    $latestUpdate = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1
-                                    if ($latestUpdate) {
-                                        $installDate = if ($latestUpdate.InstalledOn) { 
-                                            $latestUpdate.InstalledOn.ToString("yyyy-MM-dd HH:mm:ss") 
-                                        } else { 
-                                            "Unknown" 
-                                        }
-                                        Write-Output "KB:$($latestUpdate.HotFixID)|Date:$installDate"
-                                    } else {
-                                        Write-Output "KB:No updates found|Date:Unknown"
-                                    }
-                                } catch {
-                                    Write-Output "KB:Error retrieving updates|Date:Unknown"
-                                }
-                                '''
-                                document_name = 'AWS-RunPowerShellScript'
-                                parameter_name = 'commands'
-                                
-                            elif platform_type.lower() == 'linux':
-                                # Linux bash command
-                                command_script = '''
-                                #!/bin/bash
-                                
-                                # Function to get latest update for different Linux distributions
-                                get_latest_update() {
-                                    # Check if it's Ubuntu/Debian
-                                    if command -v dpkg &> /dev/null && [ -f /var/log/dpkg.log ]; then
-                                        # Ubuntu/Debian - get latest package from dpkg log
-                                        latest=$(grep "status installed" /var/log/dpkg.log | tail -1)
-                                        if [ -n "$latest" ]; then
-                                            date_part=$(echo "$latest" | awk '{print $1, $2}')
-                                            package_part=$(echo "$latest" | awk '{print $4}')
-                                            echo "Package:$package_part|Date:$date_part"
-                                        else
-                                            echo "Package:No recent updates found|Date:Unknown"
-                                        fi
-                                    
-                                    # Check if it's RHEL/CentOS/Amazon Linux
-                                    elif command -v rpm &> /dev/null && [ -f /var/log/yum.log ]; then
-                                        # RHEL/CentOS/Amazon Linux - get latest from yum log
-                                        latest=$(grep "Installed:" /var/log/yum.log | tail -1)
-                                        if [ -n "$latest" ]; then
-                                            date_part=$(echo "$latest" | awk '{print $1, $2, $3}')
-                                            package_part=$(echo "$latest" | awk '{print $4}')
-                                            echo "Package:$package_part|Date:$date_part"
-                                        else
-                                            echo "Package:No recent updates found|Date:Unknown"
-                                        fi
-                                    
-                                    # Check if it's Amazon Linux 2 with dnf
-                                    elif command -v dnf &> /dev/null && [ -f /var/log/dnf.log ]; then
-                                        # Amazon Linux 2 with dnf
-                                        latest=$(grep "SUBDEBUG Installed:" /var/log/dnf.log | tail -1)
-                                        if [ -n "$latest" ]; then
-                                            date_part=$(echo "$latest" | awk '{print $1, $2}')
-                                            package_part=$(echo "$latest" | awk '{print $4}')
-                                            echo "Package:$package_part|Date:$date_part"
-                                        else
-                                            echo "Package:No recent updates found|Date:Unknown"
-                                        fi
-                                    
-                                    else
-                                        # Generic approach - check last modified packages
-                                        if command -v rpm &> /dev/null; then
-                                            latest=$(rpm -qa --last | head -1)
-                                            if [ -n "$latest" ]; then
-                                                package_part=$(echo "$latest" | awk '{print $1}')
-                                                date_part=$(echo "$latest" | cut -d' ' -f2-)
-                                                echo "Package:$package_part|Date:$date_part"
-                                            else
-                                                echo "Package:No packages found|Date:Unknown"
-                                            fi
-                                        elif command -v dpkg &> /dev/null; then
-                                            # Fallback for Debian-based without log
-                                            latest=$(dpkg -l | grep "^ii" | tail -1)
-                                            if [ -n "$latest" ]; then
-                                                package_part=$(echo "$latest" | awk '{print $2}')
-                                                echo "Package:$package_part|Date:Unknown"
-                                            else
-                                                echo "Package:No packages found|Date:Unknown"
-                                            fi
-                                        else
-                                            echo "Package:Unsupported package manager|Date:Unknown"
-                                        fi
-                                    fi
-                                }
-                                
-                                # Execute the function
-                                get_latest_update
-                                '''
-                                document_name = 'AWS-RunShellScript'
-                                parameter_name = 'commands'
-                                
-                            else:
-                                # Unknown platform
-                                detail = f"Instance {instance_id}:\nOperating System: {os_info}\nLatest Update: Unsupported platform type: {platform_type}"
-                                post_patch_details.append(detail)
-                                continue
-                            
-                            # Execute the appropriate command
-                            response = ssm.send_command(
-                                InstanceIds=[instance_id],
-                                DocumentName=document_name,
-                                Parameters={
-                                    parameter_name: [command_script]
-                                },
-                                TimeoutSeconds=60
-                            )
-                            
-                            command_id = response['Command']['CommandId']
-                            
-                            # Wait for command to complete and get results
-                            import time
-                            max_attempts = 12  # 60 seconds total wait time
-                            attempt = 0
-                            
-                            while attempt < max_attempts:
-                                try:
-                                    invocation = ssm.get_command_invocation(
-                                        CommandId=command_id,
-                                        InstanceId=instance_id
-                                    )
-                                    
-                                    if invocation['Status'] in ['Success', 'Failed', 'Cancelled', 'TimedOut']:
-                                        break
-                                        
-                                except ssm.exceptions.InvocationDoesNotExist:
-                                    pass
-                                
-                                time.sleep(5)
-                                attempt += 1
-                            
-                            # Parse the output based on platform
-                            latest_update = "No update information available"
-                            if invocation['Status'] == 'Success' and invocation.get('StandardOutputContent'):
-                                output = invocation['StandardOutputContent'].strip()
-                                
-                                if platform_type.lower() == 'windows':
-                                    # Parse Windows output
-                                    if 'KB:' in output and 'Date:' in output:
-                                        parts = output.split('|')
-                                        kb_part = next((p for p in parts if p.startswith('KB:')), '')
-                                        date_part = next((p for p in parts if p.startswith('Date:')), '')
-                                        
-                                        if kb_part and date_part:
-                                            kb = kb_part.replace('KB:', '')
-                                            install_date = date_part.replace('Date:', '')
-                                            latest_update = f"{kb} installed on {install_date}"
-                                
-                                elif platform_type.lower() == 'linux':
-                                    # Parse Linux output
-                                    if 'Package:' in output and 'Date:' in output:
-                                        parts = output.split('|')
-                                        package_part = next((p for p in parts if p.startswith('Package:')), '')
-                                        date_part = next((p for p in parts if p.startswith('Date:')), '')
-                                        
-                                        if package_part and date_part:
-                                            package = package_part.replace('Package:', '')
-                                            install_date = date_part.replace('Date:', '')
-                                            latest_update = f"{package} installed on {install_date}"
-                            
-                            detail = f"Instance {instance_id}:\nOperating System: {os_info}\nLatest Update: {latest_update}"
-                            post_patch_details.append(detail)
-                            
-                        except Exception as e:
-                            print(f"Error getting post-patch details for {instance_id}: {str(e)}")
-                            detail = f"Instance {instance_id}:\nOperating System: Unknown\nLatest Update: Error retrieving update information"
-                            post_patch_details.append(detail)
+                    # Add any instances we couldn't reach
+                    reported = {d.split('\n')[0].split(' ')[1].rstrip(':') for d in post_patch_details}
+                    for iid in instance_ids:
+                        if iid not in reported:
+                            info = instance_map.get(iid, {'os': 'Unknown'})
+                            post_patch_details.append(f"Instance {iid}:\nOperating System: {info.get('os','Unknown')}\nLatest Update: No data collected")
                     
-                    return {
-                        'StatusCode': 200,
-                        'postPatchDetails': post_patch_details
-                    }
+                    s3.put_object(
+                        Bucket=state_bucket, Key=f"{state_prefix}/post-patch-details.json",
+                        Body=json.dumps({'postPatchDetails': post_patch_details}), ServerSideEncryption='AES256'
+                    )
+                    return {'detailCount': str(len(post_patch_details))}
               Runtime: python3.11
               InputPayload:
-                instanceIds: '{{ getManagedInstances.instanceIds }}'
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
             outputs:
-              - Type: StringList
-                Name: postPatchDetails
-                Selector: $.Payload.postPatchDetails
+              - Type: String
+                Name: detailCount
+                Selector: $.Payload.detailCount
 
           - name: disableAdminMaintenance
             action: aws:executeScript
@@ -2265,25 +2058,33 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                     import boto3
+                    import json
                     
+                    s3 = boto3.client('s3')
                     workspaces = boto3.client('workspaces')
-                    workspace_ids = events['matchedWorkspaceIds']
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
                     
-                    for workspace_id in workspace_ids:
+                    try:
+                        obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                        data = json.loads(obj['Body'].read().decode('utf-8'))
+                    except s3.exceptions.NoSuchKey:
+                        print("No managed-instances.json found, skipping")
+                        return {'StatusCode': 200, 'Message': 'No state file found, skipping'}
+                    
+                    for workspace_id in data.get('matchedWorkspaceIds', []):
                         try:
-                            response = workspaces.modify_workspace_state(
-                                WorkspaceId=str(workspace_id),
-                                WorkspaceState='AVAILABLE'
-                            )
+                            workspaces.modify_workspace_state(WorkspaceId=str(workspace_id), WorkspaceState='AVAILABLE')
                             print(f"Set WorkSpace {workspace_id} to Available")
-                            
                         except Exception as e:
                             print(f"Error processing workspace {workspace_id}: {str(e)}")
                     
                     return {'StatusCode': 200, 'Message': 'WorkSpaces set to AVAILABLE state'}
               Runtime: python3.11
               InputPayload:
-                matchedWorkspaceIds: '{{ getManagedInstances.matchedWorkspaceIds }}'
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
 
           - name: branchStopWorkspaces
@@ -2303,15 +2104,32 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                     import boto3
+                    import json
                     
+                    s3 = boto3.client('s3')
                     workspaces = boto3.client('workspaces')
-                    workspace_ids = events['matchedWorkspaceIds']
-                    running_modes = events['workspaceModes']
+                    state_bucket = events['stateBucket']
+                    directory_id = events['directoryId']
+                    state_prefix = f"maintenance-state/{directory_id}/{events['executionId']}"
                     
-                    workspaces_to_stop = []
-                    for workspace_id, running_mode in zip(workspace_ids, running_modes):
-                        if running_mode == 'AUTO_STOP':
-                            workspaces_to_stop.append(workspace_id)
+                    try:
+                        obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/managed-instances.json")
+                        data = json.loads(obj['Body'].read().decode('utf-8'))
+                    except s3.exceptions.NoSuchKey:
+                        print("No managed-instances.json found, skipping")
+                        return {'StatusCode': 200, 'Message': 'No state file found, skipping'}
+                    
+                    workspace_ids = data.get('matchedWorkspaceIds', [])
+                    
+                    # Look up running modes directly from WorkSpaces API
+                    running_modes = {}
+                    paginator = workspaces.get_paginator('describe_workspaces')
+                    for page in paginator.paginate(DirectoryId=directory_id):
+                        for ws in page['Workspaces']:
+                            if ws['WorkspaceId'] in workspace_ids:
+                                running_modes[ws['WorkspaceId']] = ws.get('WorkspaceProperties', {}).get('RunningMode', 'UNKNOWN')
+                    
+                    workspaces_to_stop = [wid for wid in workspace_ids if running_modes.get(wid) == 'AUTO_STOP']
                     
                     if not workspaces_to_stop:
                         print("No AUTO_STOP WorkSpaces to stop")
@@ -2320,36 +2138,25 @@ Resources:
                     batch_size = 25
                     for i in range(0, len(workspaces_to_stop), batch_size):
                         batch = workspaces_to_stop[i:i + batch_size]
-                        
                         try:
                             response = workspaces.stop_workspaces(
-                                StopWorkspaceRequests=[
-                                    {'WorkspaceId': w_id} for w_id in batch
-                                ]
+                                StopWorkspaceRequests=[{'WorkspaceId': w_id} for w_id in batch]
                             )
-                            
                             if response['FailedRequests']:
                                 print(f"Failed requests: {response['FailedRequests']}")
-                            else:
-                                print(f"Successfully requested stop for WorkSpaces: {batch}")
-                            
                         except Exception as e:
                             print(f"Error stopping workspaces batch: {str(e)}")
                     
                     return {
                         'StatusCode': 200,
-                        'Message': f'Completed stop requests for {len(workspaces_to_stop)} AUTO_STOP WorkSpaces',
-                        'stoppedWorkspaces': workspaces_to_stop
+                        'Message': f'Completed stop requests for {len(workspaces_to_stop)} AUTO_STOP WorkSpaces'
                     }
               Runtime: python3.11
               InputPayload:
-                matchedWorkspaceIds: '{{ getManagedInstances.matchedWorkspaceIds }}'
-                workspaceModes: '{{ getWorkspaces.workspaceModes }}'
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
-            outputs:
-              - Type: StringList
-                Name: stoppedWorkspaces
-                Selector: $.Payload.stoppedWorkspaces
 
           - name: branchSnsNotification
             action: aws:branch
@@ -2367,117 +2174,109 @@ Resources:
               Script: |-
                 def script_handler(events, context):
                     import boto3
+                    import json
                     
+                    s3 = boto3.client('s3')
                     sns = boto3.client('sns')
+                    state_bucket = events['stateBucket']
+                    state_prefix = f"maintenance-state/{events['directoryId']}/{events['executionId']}"
                     
-                    message = f"WorkSpaces Patching Summary\n"
-                    message += f"===========================\n\n"
-
-                    message += f"Initial Discovery:\n"
-                    message += f"------------------\n"
+                    def read_state(key):
+                        try:
+                            obj = s3.get_object(Bucket=state_bucket, Key=f"{state_prefix}/{key}")
+                            return json.loads(obj['Body'].read().decode('utf-8'))
+                        except Exception:
+                            return {}
+                    
+                    ws_data = read_state('workspaces.json')
+                    mi_data = read_state('managed-instances.json')
+                    ping_data = read_state('ping-status.json')
+                    post_data = read_state('post-patch-details.json')
+                    
+                    excluded = ws_data.get('excludedWorkspaces', [])
+                    unmanaged = mi_data.get('unmanagedWorkspaceIds', [])
+                    offline = ping_data.get('offlineInstances', [])
+                    post_details = post_data.get('postPatchDetails', [])
+                    
+                    message = "WorkSpaces Patching Summary\n"
+                    message += "===========================\n\n"
+                    message += f"Initial Discovery:\n------------------\n"
                     message += f"Found {events['workspaceCount']} WorkSpace(s) eligible for patching\n"
                     message += f"{events['excludedCount']} WorkSpace(s) excluded from patching due to tags"
-                    if events['excludedWorkspaces']:
-                        message += f":\n{', '.join(events['excludedWorkspaces'])}"
-
-                    message += f"\n\nSystems Manager Status:\n"
-                    message += f"-----------------------\n"
+                    if excluded:
+                        message += f":\n{', '.join(excluded)}"
+                    
+                    message += f"\n\nSystems Manager Status:\n-----------------------\n"
                     message += f"Found {events['unmanagedCount']} WorkSpace(s) not managed by Systems Manager"
-                    if events['unmanagedWorkspaceIds']:
-                        message += f":\n{', '.join(events['unmanagedWorkspaceIds'])}"
+                    if unmanaged:
+                        message += f":\n{', '.join(unmanaged)}"
                     
                     message += f"\n\nTotal WorkSpaces to be patched: {events['matchedWorkspacesCount']}"
                     
-                    message += f"\n\nSSM Ping Status Before Patching:\n"
-                    message += f"--------------------------------\n"
+                    message += f"\n\nSSM Ping Status Before Patching:\n--------------------------------\n"
                     message += f"Online instances: {events['onlineCount']}\n"
                     message += f"Offline instances: {events['offlineCount']}"
-                    if events['offlineInstances']:
-                      message += "\nOffline instance details:\n"
-                      for instance in events['offlineInstances']:
-                        message += f"- {instance}\n"
-                      
-                    message += f"\nPatch Execution Details:\n"
-                    message += f"------------------------\n"
-                    # Handle command ID - extract the actual command ID from whichever step ran
-                    import re
+                    if offline:
+                        message += "\nOffline instance details:\n"
+                        for inst in offline:
+                            message += f"- {inst}\n"
                     
-                    command_id_byol = events.get('commandIdBYOL', '')
-                    command_id_instances = events.get('commandIdInstances', '')
-                    
-                    # Clean up any unresolved template variables and extract valid command IDs
-                    def extract_command_id(raw_id):
-                        if not raw_id:
-                            return ''
-                        # Simple extraction - just return the raw_id if it looks like a command ID
-                        if len(raw_id) > 30 and '-' in raw_id:
-                            return raw_id
-                        return ''
-                    
-                    command_id = extract_command_id(command_id_byol) or extract_command_id(command_id_instances)
-                    message += f"Systems Manager Run Command ID: {command_id}\n"
+                    message += f"\nPatch Execution Details:\n------------------------\n"
+                    cmd_data = read_state('patch-command-ids.json')
+                    command_ids = cmd_data.get('commandIds', [])
+                    if command_ids:
+                        message += f"Systems Manager Run Command IDs: {', '.join(command_ids)}\n"
                     message += f"Successfully patched: {events['successCount']} WorkSpaces\n"
                     message += f"Failed to patch: {events['failedCount']} WorkSpaces\n"
                     
-                    message += f"\nDetailed Patch Status:\n"
-                    message += f"----------------------\n"
-                    for status in events['finalStatus']:
-                      message += f"{status}\n"
+                    status_data = read_state('patch-status-detail.json')
+                    final_status = status_data.get('finalStatus', [])
                     
-                    # Add driver update information
+                    message += f"\nDetailed Patch Status:\n----------------------\n"
+                    for status in final_status:
+                        message += f"{status}\n"
+                    
                     if events.get('updateDrivers') == 'Yes':
-                        message += f"\nAWS Driver Updates:\n"
-                        message += f"-------------------\n"
-                        message += f"Driver updates were enabled during maintenance.\n"
-                        message += f"NVMe and ENA drivers updated for all WorkSpaces\n"
+                        message += f"\nAWS Driver Updates:\n-------------------\n"
+                        message += "Driver updates were enabled during maintenance.\n"
+                        message += "NVMe and ENA drivers updated for all WorkSpaces\n"
                     else:
-                        message += f"\nAWS Driver Updates: Disabled\n"
+                        message += "\nAWS Driver Updates: Disabled\n"
                     
-                    # Add post-patch details
-                    message += f"\nPost-Patch Details:\n"
-                    message += f"-------------------\n"
-                    if events.get('postPatchDetails'):
-                        for detail in events['postPatchDetails']:
+                    message += f"\nPost-Patch Details:\n-------------------\n"
+                    if post_details:
+                        for detail in post_details:
                             message += f"{detail}\n\n"
                     else:
                         message += "Post-patch details not available\n"
-                      
+                    
                     try:
-                        response = sns.publish(
+                        sns.publish(
                             TopicArn=events['snsTopicArn'],
                             Subject='WorkSpaces Patching Automation Summary',
                             Message=message
                         )
                         print("SNS notification sent successfully")
-                        
                     except Exception as e:
                         print(f"Error sending SNS notification: {str(e)}")
                         raise
                     
-                    return {
-                        'StatusCode': 200,
-                        'Message': 'SNS notification sent'
-                    }
+                    return {'StatusCode': 200, 'Message': 'SNS notification sent'}
               Runtime: python3.11
               InputPayload:
                 unmanagedCount: '{{ getManagedInstances.unmanagedCount }}'
                 matchedWorkspacesCount: '{{ getManagedInstances.matchedWorkspacesCount }}'
                 onlineCount: '{{ monitorPingStatus.onlineCount }}'
                 offlineCount: '{{ monitorPingStatus.offlineCount }}'
-                offlineInstances: '{{ monitorPingStatus.offlineInstances }}'
-                finalStatus: '{{ recordPatchResults.finalStatus }}'
-                commandIdBYOL: '{{ patchBYOL.commandId }}'
-                commandIdInstances: '{{ patchInstances.commandId }}'
                 failedCount: '{{ recordPatchResults.failedCount }}'
                 snsTopicArn: '{{ SnsTopicArn }}'
-                unmanagedWorkspaceIds: '{{ getManagedInstances.unmanagedWorkspaceIds }}'
                 workspaceCount: '{{ getWorkspaces.workspaceCount }}'
                 successCount: '{{ recordPatchResults.successCount }}'
                 excludedCount: '{{ getWorkspaces.excludedCount }}'
-                excludedWorkspaces: '{{ getWorkspaces.excludedWorkspaces }}'
-                postPatchDetails: '{{ getPostPatchDetails.postPatchDetails }}'
                 updateDrivers: '{{ UpdateAWSDrivers }}'
-                directoryTenancy: '{{ getDirectoryTenancy.Tenancy }}'
+                stateBucket: '{{ StateBucket }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+                executionId: '{{ automation:EXECUTION_ID }}'
               Handler: script_handler
 
           - name: branchComplianceReport
@@ -2490,18 +2289,35 @@ Resources:
                   StringEquals: 'Yes'
 
           - name: generateComplianceReport
-            action: aws:invokeLambdaFunction
+            action: aws:executeScript
+            timeoutSeconds: 900
             isEnd: true
             inputs:
-              FunctionName: !If 
-                - GenerateReport
-                - !Ref ComplianceReportLambda
-                - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:dummy'
-              Payload: |
-                {
-                  "PatchGroup": "WorkSpaces-{{ getWorkspaces.directoryId }}",
-                  "DirectoryId": "{{ getWorkspaces.directoryId }}"
-                }
+              Script: |-
+                def script_handler(events, context):
+                    import boto3, json, time
+                    
+                    client = boto3.client('lambda')
+                    # Invoke asynchronously to avoid blocking timeout
+                    client.invoke(
+                        FunctionName=events['functionName'],
+                        InvocationType='Event',
+                        Payload=json.dumps({
+                            'PatchGroup': events['patchGroup'],
+                            'DirectoryId': events['directoryId']
+                        })
+                    )
+                    print(f"Lambda invoked asynchronously: {events['functionName']}")
+                    return {'status': 'Lambda invoked asynchronously'}
+              Runtime: python3.11
+              InputPayload:
+                functionName: !If 
+                  - GenerateReport
+                  - !Ref ComplianceReportLambda
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:dummy'
+                patchGroup: 'WorkSpaces-{{ getWorkspaces.directoryId }}'
+                directoryId: '{{ getWorkspaces.directoryId }}'
+              Handler: script_handler
 
   WorkSpacesMaintenanceWindowTask:
     Type: AWS::SSM::MaintenanceWindowTask
@@ -2544,6 +2360,9 @@ Resources:
         UpdateAWSDrivers:
           Values:
             - !Ref UpdateAWSDrivers
+        StateBucket:
+          Values:
+            - !Ref MaintenanceStateBucket
 
 Outputs:
   AutomationDocumentArn:
@@ -2604,3 +2423,6 @@ Outputs:
       - CreateLogGroup
       - !GetAtt WorkSpacesMaintenanceLogGroup.Arn
       - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CloudWatchLogGroupName}'
+  MaintenanceStateBucketName:
+    Description: Name of the S3 bucket used for automation state between steps
+    Value: !Ref MaintenanceStateBucket
